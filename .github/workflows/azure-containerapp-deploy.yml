@@ -1,0 +1,103 @@
+# Workflow: Build Docker image from src/, push to Azure Container Registry,
+# and deploy to Azure Container Apps.
+#
+# Required GitHub secrets:
+#   Azure OIDC authentication (preferred over a long-lived credential):
+#     AZURE_CLIENT_ID        – App registration / managed-identity client ID
+#     AZURE_TENANT_ID        – Azure AD tenant ID
+#     AZURE_SUBSCRIPTION_ID  – Azure subscription ID
+#
+#   Container registry:
+#     ACR_LOGIN_SERVER       – e.g. myregistry.azurecr.io
+#
+#   Container App identifiers:
+#     AZURE_RESOURCE_GROUP   – Resource group that owns the Container App
+#     AZURE_CONTAINERAPP_NAME – Name of the Container App to update
+#
+#   Application environment variables (injected into the Container App):
+#     FOUNDRY_ENDPOINT
+#     gpt_endpoint
+#     embedding_endpoint
+#     phi_4_endpoint
+
+name: Build and Deploy to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main
+
+# Grant the workflow token the extra permissions required for OIDC login.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out source code ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Log in to Azure via OIDC (no long-lived credential needed) ─────
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── 3. Authenticate Docker to ACR via the Azure CLI token ─────────────
+      # az acr login --name accepts both "myregistry" and "myregistry.azurecr.io";
+      # stripping the domain suffix makes it unambiguous.
+      - name: Log in to Azure Container Registry
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+        run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+
+      # ── 4. Derive a lowercase image name from the repository name ────────
+      - name: Set image name
+        run: |
+          echo "IMAGE_NAME=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" \
+            >> "$GITHUB_ENV"
+
+      # ── 5. Set up Docker Buildx ───────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 6. Build and push the image ───────────────────────────────────────
+      #   Build context : ./src   (only files inside src/ are sent to the daemon)
+      #   Dockerfile    : ./src/Dockerfile
+      #   Tag           : <registry>/<image-name>:<git-sha>
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          push: true
+          tags: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # ── 7. Update the Container App to the new image + env vars ──────────
+      # The four endpoint values are read from GitHub secrets and written into
+      # the Container App's environment at deploy time.  Any other env vars
+      # that are already set on the Container App are left untouched.
+      # Note: the mixed-casing of the env var names (e.g. gpt_endpoint) matches
+      # the names that already exist on the Container App and must be preserved.
+      - name: Deploy to Azure Container Apps
+        env:
+          FOUNDRY_ENDPOINT: ${{ secrets.FOUNDRY_ENDPOINT }}
+          gpt_endpoint: ${{ secrets.gpt_endpoint }}
+          embedding_endpoint: ${{ secrets.embedding_endpoint }}
+          phi_4_endpoint: ${{ secrets.phi_4_endpoint }}
+        run: |
+          az containerapp update \
+            --name "${{ secrets.AZURE_CONTAINERAPP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            --set-env-vars \
+              "FOUNDRY_ENDPOINT=${FOUNDRY_ENDPOINT}" \
+              "gpt_endpoint=${gpt_endpoint}" \
+              "embedding_endpoint=${embedding_endpoint}" \
+              "phi_4_endpoint=${phi_4_endpoint}"
